@@ -40,5 +40,69 @@ from ..model_cache import get_preds  # noqa: F401
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+    rules = cfg["second_opinion"]
+    issues = []
+
+    for image_path in ds.image_files():
+        stem = image_path.stem
+        rows = preds.get(stem)
+        if rows is None or ds.read_label_lines(stem) is None:
+            continue
+
+        labels = []
+        for line_no, text in ds.read_label_lines(stem) or []:
+            try:
+                parsed = parse_yolo_line(text)
+            except (ValueError, OverflowError):
+                continue
+            if 0 <= parsed[0] < len(ds.classes):
+                labels.append((line_no, parsed[0], parsed[1:]))
+
+        size = ds.image_size(stem)
+        if size is None:
+            continue
+        image_width, image_height = size
+        parsed_preds = []
+        for row in rows:
+            cls, conf, cx, cy, width, height = row
+            box = (float(cx), float(cy), float(width), float(height))
+            parsed_preds.append((int(cls), float(conf), box))
+
+        candidate_preds = [
+            (cls, conf, box) for cls, conf, box in parsed_preds
+            if conf >= rules["conf"] and box[2] * image_width * box[3] * image_height >= rules["min_area_px"]
+        ]
+        for cls, conf, box in candidate_preds:
+            overlaps = [
+                (label_cls, iou_xywh(box, label_box))
+                for _, label_cls, label_box in labels
+                if iou_xywh(box, label_box) >= rules["iou_missing"]
+            ]
+            if not overlaps:
+                issues.append(Issue("second_opinion", WARN, "POSSIBLE_MISSING", stem, "model thấy vật chưa có box nhãn", extra={"conf": conf}))
+                continue
+
+            same_class = [iou for label_cls, iou in overlaps if label_cls == cls]
+            other_class = [iou for label_cls, iou in overlaps if label_cls != cls]
+            if same_class:
+                best_iou = max(same_class)
+                if best_iou < rules["iou_loose"]:
+                    issues.append(Issue("second_opinion", WARN, "POSSIBLE_LOOSE_BOX", stem, "box nhãn có thể lỏng hoặc lệch", extra={"conf": conf, "iou": best_iou}))
+            elif other_class:
+                best_iou = max(other_class)
+                if best_iou >= rules["iou_match"]:
+                    issues.append(Issue("second_opinion", WARN, "POSSIBLE_WRONG_CLASS", stem, "model và nhãn có thể khác lớp", extra={"conf": conf, "iou": best_iou}))
+
+        for line_no, label_cls, label_box in labels:
+            matched = any(
+                conf >= rules["fp_conf"] and iou_xywh(label_box, box) >= rules["iou_missing"]
+                for _, conf, box in parsed_preds
+            )
+            if not matched:
+                issues.append(Issue(
+                    "second_opinion", WARN, "POSSIBLE_FALSE_POS", stem,
+                    "box nhãn không khớp dự đoán của model", line_no,
+                ))
+    return issues
